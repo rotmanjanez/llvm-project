@@ -49,6 +49,7 @@
 #include "llvm/CodeGen/TargetLowering.h"
 #include "llvm/CodeGen/TargetPassConfig.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
+#include <fstream>
 #include "llvm/IR/DebugLoc.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/PrintPasses.h"
@@ -64,6 +65,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/Utils/CodeLayout.h"
+#include "llvm/IR/DebugInfoMetadata.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
@@ -73,6 +75,11 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 using namespace llvm;
 
@@ -643,8 +650,8 @@ public:
   }
 
   bool runOnMachineFunction(MachineFunction &MF) override {
-    if (skipFunction(MF.getFunction()))
-      return false;
+    // if (skipFunction(MF.getFunction()))
+    //  return false;
 
     auto *MBPI =
         &getAnalysis<MachineBranchProbabilityInfoWrapperPass>().getMBPI();
@@ -3565,7 +3572,146 @@ void MachineBlockPlacementPass::printPipeline(
     OS << "<no-tail-merge>";
 }
 
+DICompileUnit* findCompileUnit(DISubprogram *SP) {
+  for (const auto&  op : SP->operands()) {
+    auto *md = op.get();
+    if (!md)
+      continue;
+
+    if (auto *cu = dyn_cast<DICompileUnit>(md)) {
+      // Found the compile unit
+      return cu;
+    }
+  }
+  report_fatal_error("DISubprogram has no compile unit!", false);
+  return nullptr;
+}
+
+DIFile* findCompilationFile(DISubprogram *SP) {
+  auto* cu = findCompileUnit(SP);
+  for (const auto&  op : cu->operands()) {
+    auto *md = op.get();
+    if (!md)
+      continue;
+
+    if (auto *file = dyn_cast<DIFile>(md)) {
+      // Found the compile unit file
+      return file;
+    }
+  }
+  report_fatal_error("Compile unit has no file!", false);
+  return nullptr;
+}
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <mutex>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <errno.h>
+
+static char* file_name = nullptr;
+
+static void custom_closer(std::ofstream* f) {
+  if (f) {
+    if (f->is_open()) f->close();
+
+    if (file_name) {
+      std::string end_file_name = std::string(file_name) + ".end";
+      std::ofstream end_f(end_file_name);
+      // no extra error handling; just let it go out of scope
+      end_f.close();
+
+      ::free(file_name);
+      file_name = nullptr;
+    }
+    delete f;
+  }
+}
+
+void submit_stats(const MachineFunction &MF) {
+  // --- Static file setup ---
+  static auto out = []() -> std::unique_ptr<std::ofstream, decltype(&custom_closer)> {
+    const char *tmpl = std::getenv("LLVM_CFG_FILE_TEMPLATE");
+    if (!tmpl) return {nullptr, custom_closer};
+
+    // Create a temporary filename from template
+    file_name = ::strdup(tmpl);
+    if (!file_name) return {nullptr, custom_closer};
+
+    int fd = ::mkstemp(file_name);
+    if (fd >= 0) ::close(fd);
+
+    // Open regular file for writing
+    auto *ofs = new std::ofstream(file_name, std::ios::out | std::ios::binary);
+    return {ofs, custom_closer};
+  }();
+
+  static std::mutex file_mutex;
+  std::lock_guard<std::mutex> guard(file_mutex);
+
+  if (!out) {
+    // keep behavior minimal; just return if not set up
+    return;
+  }
+
+  const auto &target = MF.getTarget();
+  const auto &fn = MF.getFunction();
+  auto fn_name = MF.getName();
+
+  // Begin JSON output (simple, no extra escaping/handling)
+  (*out) << "{\"fn\":\"" << fn_name.str()
+         << "\",\"opt\":" << static_cast<int>(target.getOptLevel())
+         << ",\"tgt\":\"" << target.getTargetTriple().str() << "\"";
+
+  if (DISubprogram *SP = fn.getSubprogram(); SP) {
+    auto *file = findCompilationFile(SP);
+    (*out) << ",\"cu\":\""   << file->getFilename().str()
+           << "\",\"file\":\"" << SP->getFilename().str()
+           << "\",\"dir\":\""  << SP->getDirectory().str() << "\"";
+  }
+
+  (*out) << ",\"bbs\":[";
+  bool firstBB = true;
+
+  for (const MachineBasicBlock &MBB : MF) {
+    if (!firstBB) (*out) << ",";
+    firstBB = false;
+
+    auto NonDbgInsts =
+        instructionsWithoutDebug(MBB.instr_begin(), MBB.instr_end());
+    size_t NumInsts = std::distance(NonDbgInsts.begin(), NonDbgInsts.end());
+
+    (*out) << "{\"b\":" << reinterpret_cast<std::uintptr_t>(&MBB)
+           << ",\"#i\":" << NumInsts << ",\"s\":[";
+
+    bool first = true;
+    for (const auto &succ : MBB.successors()) {
+      if (!first) (*out) << ",";
+      first = false;
+      (*out) << reinterpret_cast<std::uintptr_t>(succ);
+    }
+
+    (*out) << "],\"p\":[";
+    first = true;
+    for (const auto &pred : MBB.predecessors()) {
+      if (!first) (*out) << ",";
+      first = false;
+      (*out) << reinterpret_cast<std::uintptr_t>(pred);
+    }
+
+    (*out) << "]}";
+  }
+
+  (*out) << "]}\n";
+  out->flush(); // explicit flush
+}
+
 bool MachineBlockPlacement::run(MachineFunction &MF) {
+  submit_stats(MF);
 
   // Check for single-block functions and skip them.
   if (std::next(MF.begin()) == MF.end())
