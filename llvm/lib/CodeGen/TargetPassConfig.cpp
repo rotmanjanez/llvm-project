@@ -1196,8 +1196,8 @@ void TargetPassConfig::addMachinePasses() {
   addGCPasses();
 
   // Basic block placement.
-  if (getOptLevel() != CodeGenOptLevel::None)
-    addBlockPlacement();
+  // if (getOptLevel() != CodeGenOptLevel::None)
+  addBlockPlacement();
 
   // Insert before XRay Instrumentation.
   addPass(&FEntryInserterID);
