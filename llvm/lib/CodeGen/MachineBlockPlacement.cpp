@@ -70,7 +70,10 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <random>
 #include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -84,6 +87,21 @@ STATISTIC(CondBranchTakenFreq,
           "Potential frequency of taking conditional branches");
 STATISTIC(UncondBranchTakenFreq,
           "Potential frequency of taking unconditional branches");
+
+static cl::opt<bool> RandomPlacement(
+    "block-placement-random",
+    cl::desc("Randomize block placement (for testing purposes)."),
+    cl::init(1), cl::Hidden);
+
+static cl::opt<bool> NoPlacement(
+    "block-placement-none",
+    cl::desc("Randomize block placement (for testing purposes)."),
+    cl::init(0), cl::Hidden);
+
+static cl::opt<bool> ReversePlacement(
+    "block-placement-reverse",
+    cl::desc("Randomize block placement (for testing purposes)."),
+    cl::init(0), cl::Hidden);
 
 static cl::opt<unsigned> AlignAllBlock(
     "align-all-blocks",
@@ -3566,16 +3584,105 @@ void MachineBlockPlacementPass::printPipeline(
 }
 
 bool MachineBlockPlacement::run(MachineFunction &MF) {
-
   // Check for single-block functions and skip them.
   if (std::next(MF.begin()) == MF.end())
     return false;
 
-  F = &MF;
-  OptLevel = F->getTarget().getOptLevel();
+  static const char* const SEED_ENV_VAR = std::getenv("LLVM_BLOCK_PLACEMENT_SEED");
 
   TII = MF.getSubtarget().getInstrInfo();
   TLI = MF.getSubtarget().getTargetLowering();
+
+  if (+RandomPlacement + +ReversePlacement + +NoPlacement > 1)
+    report_fatal_error(
+        "Only one of -random-block-placement, -reverse-block-placement, and "
+        "-no-block-placement can be specified.");
+  
+  if (NoPlacement) {
+    return false;
+  }
+  if (RandomPlacement || ReversePlacement) {
+    
+    MF.insert(MF.begin(), MF.CreateMachineBasicBlock());
+    MachineBasicBlock &NewEntry = MF.front();
+    MachineBasicBlock &OldEntry = *std::next(MF.begin());
+    NewEntry.addSuccessor(&OldEntry, BranchProbability::getOne());
+    TII->insertUnconditionalBranch(NewEntry, &OldEntry, DebugLoc());
+
+    MF.begin()->updateTerminator(nullptr);
+
+    SmallVector<MachineBasicBlock *, 8> BlockOrder(MF.size());
+    std::transform(MF.begin(), MF.end(), BlockOrder.begin(),
+                   [](MachineBasicBlock &MBB) { return &MBB; });
+
+    auto OriginalBlockOrder = BlockOrder;
+
+    std::unordered_map<MachineBasicBlock*, MachineBasicBlock*> mustFollow{};
+    std::unordered_set<MachineBasicBlock*> isMustFollow{};
+
+    for (auto it = MF.begin(); it != MF.end(); ++it) {
+      MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
+      
+      SmallVector<MachineOperand, 4> Cond; // For analyzeBranch.
+      if (TII->analyzeBranch(*it, TBB, FBB, Cond) && it->canFallThrough()) {
+        auto next = std::next(it);
+        if (next != MF.end()) {
+          // errs() << &*it << " -> " << &*next << "\n";
+          return true;
+
+         mustFollow[&*it] = &*next;
+         isMustFollow.insert(&*next);
+        }
+      }
+    }
+
+    auto it = std::remove_if(BlockOrder.begin(), BlockOrder.end(), [&isMustFollow](auto bPtr){ return isMustFollow.find(bPtr) != isMustFollow.end(); });
+    if (it != BlockOrder.end()) BlockOrder.erase(it);
+
+    if (RandomPlacement) {
+      auto functionName = MF.getFunction().getName();
+      std::hash<std::string> hasher;
+      auto seedOffset = hasher(functionName.str());
+      size_t seedBase = std::stoi(SEED_ENV_VAR);
+      if (seedBase == 0) return true;
+
+      auto seed = hash_combine(seedBase, seedOffset);
+        
+      std::srand(seed);
+
+      std::random_device Rd{};
+      std::mt19937 Gen{Rd()};
+      std::shuffle(std::next(BlockOrder.begin()), BlockOrder.end(),Gen);
+    } else {
+      std::reverse(std::next(BlockOrder.begin()), BlockOrder.end());
+    }
+
+    for (auto MbbIt = BlockOrder.begin(); MbbIt != BlockOrder.end(); ++MbbIt) {
+      auto bb =  *MbbIt;
+      MF.splice(MF.end(), bb);
+
+      while (mustFollow.find( bb) != mustFollow.end()) {
+        bb = mustFollow[bb];
+        
+        MF.splice(MF.end(), bb);
+      }
+    }
+
+    for(auto oi = OriginalBlockOrder.begin(), oe = OriginalBlockOrder.end(); oi != oe; ++oi) {
+      auto *MBB = *oi;
+      TII = MF.getSubtarget().getInstrInfo();
+      SmallVector<MachineOperand, 4> Cond;
+      MachineBasicBlock *TBB = nullptr, *FBB = nullptr; // For analyzeBranch.
+      if (!TII->analyzeBranch(*MBB, TBB, FBB, Cond)) {
+        MBB->updateTerminator(std::next(oi) == oe ? nullptr : *std::next(oi));
+      }
+    }
+
+    return true;
+  }
+
+  F = &MF;
+  OptLevel = F->getTarget().getOptLevel();
 
   // Initialize PreferredLoopExit to nullptr here since it may never be set if
   // there are no MachineLoops.

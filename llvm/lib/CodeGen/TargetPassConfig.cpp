@@ -1196,6 +1196,7 @@ void TargetPassConfig::addMachinePasses() {
   addGCPasses();
 
   // Basic block placement.
+  // 
   if (getOptLevel() != CodeGenOptLevel::None)
     addBlockPlacement();
 

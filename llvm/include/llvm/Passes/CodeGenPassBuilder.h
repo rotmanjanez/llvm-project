@@ -1053,6 +1053,7 @@ Error CodeGenPassBuilder<Derived, TargetMachineT>::addMachinePasses(
   derived().addGCPasses(addPass);
 
   // Basic block placement.
+  //
   if (getOptLevel() != CodeGenOptLevel::None)
     derived().addBlockPlacement(addPass);
 
