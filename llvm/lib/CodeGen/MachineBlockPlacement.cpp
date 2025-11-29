@@ -62,6 +62,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Transforms/Utils/CodeLayout.h"
@@ -3612,6 +3613,7 @@ DIFile* findCompilationFile(DISubprogram *SP) {
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#include <unordered_map>
 
 static char* file_name = nullptr;
 
@@ -3632,7 +3634,7 @@ static void custom_closer(std::ofstream* f) {
   }
 }
 
-void submit_stats(const MachineFunction &MF) {
+void submit_stats(MachineFunction &MF) {
   // --- Static file setup ---
   static auto out = []() -> std::unique_ptr<std::ofstream, decltype(&custom_closer)> {
     const char *tmpl = std::getenv("LLVM_CFG_FILE_TEMPLATE");
@@ -3654,9 +3656,23 @@ void submit_stats(const MachineFunction &MF) {
   std::lock_guard<std::mutex> guard(file_mutex);
 
   if (!out) {
-    // keep behavior minimal; just return if not set up
     return;
   }
+
+  std::unordered_map<const MachineBasicBlock*, const MachineBasicBlock*> mustFollow{};
+  auto TII = MF.getSubtarget().getInstrInfo();
+
+  for (auto it = MF.begin(); it != MF.end(); ++it) {
+    MachineBasicBlock *TBB = nullptr, *FBB = nullptr;
+      
+    SmallVector<MachineOperand, 4> Cond; // For analyzeBranch.
+    if (TII->analyzeBranch(*it, TBB, FBB, Cond) && it->canFallThrough()) {
+      auto next = std::next(it);
+      if (next != MF.end()) {
+          mustFollow[&*it] = &*next;
+        }
+      }
+    }
 
   const auto &target = MF.getTarget();
   const auto &fn = MF.getFunction();
@@ -3692,7 +3708,7 @@ void submit_stats(const MachineFunction &MF) {
     for (const auto &succ : MBB.successors()) {
       if (!first) (*out) << ",";
       first = false;
-      (*out) << reinterpret_cast<std::uintptr_t>(succ);
+      (*out) <<  "[" << reinterpret_cast<std::uintptr_t>(succ) << "," << ((mustFollow[&MBB] == succ) ? 1 : 0) << "]";
     }
 
     (*out) << "],\"p\":[";
