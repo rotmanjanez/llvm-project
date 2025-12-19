@@ -19,6 +19,23 @@ pkg_check_modules(PC_LIBEDIT QUIET libedit)
 find_path(LibEdit_INCLUDE_DIRS NAMES histedit.h HINTS ${PC_LIBEDIT_INCLUDE_DIRS})
 find_library(LibEdit_LIBRARIES NAMES edit HINTS ${PC_LIBEDIT_LIBRARY_DIRS})
 
+## On some Linux distributions the provided libedit (static) depends on
+## libbsd for BSD compatibility functions like strvis/strvisx. If a
+## libbsd is available on the system, append it to the returned
+## `LibEdit_LIBRARIES` so linkers include it when building against
+## static libedit.
+find_library(LibBSD_LIBRARIES NAMES bsd)
+if(LibBSD_LIBRARIES)
+  list(APPEND LibEdit_LIBRARIES ${LibBSD_LIBRARIES})
+endif()
+
+## libedit may depend on termcap/terminfo (tinfo) or ncurses; if so, make sure
+## to pull that in for static linkers so symbols like 'tputs' are resolved.
+find_library(LibTINFO_LIBRARIES NAMES tinfo ncurses ncursesw curses termcap)
+if(LibTINFO_LIBRARIES)
+  list(APPEND LibEdit_LIBRARIES ${LibTINFO_LIBRARIES})
+endif()
+
 include(CheckIncludeFile)
 if(LibEdit_INCLUDE_DIRS AND EXISTS "${LibEdit_INCLUDE_DIRS}/histedit.h")
   include(CMakePushCheckState)
