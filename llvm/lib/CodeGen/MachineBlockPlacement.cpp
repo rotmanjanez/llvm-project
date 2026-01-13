@@ -3637,7 +3637,7 @@ bool MachineBlockPlacement::run(MachineFunction &MF) {
     }
 
     auto it = std::remove_if(BlockOrder.begin(), BlockOrder.end(), [&isMustFollow](auto bPtr){ return isMustFollow.find(bPtr) != isMustFollow.end(); });
-    if (it != BlockOrder.end()) BlockOrder.erase(it);
+    if (it != BlockOrder.end()) BlockOrder.erase(it, BlockOrder.end());
 
     if (RandomPlacement) {
       auto functionName = MF.getFunction().getName();
@@ -3647,11 +3647,8 @@ bool MachineBlockPlacement::run(MachineFunction &MF) {
       if (seedBase == 0) return true;
 
       auto seed = hash_combine(seedBase, seedOffset);
-        
-      std::srand(seed);
 
-      std::random_device Rd{};
-      std::mt19937 Gen{Rd()};
+      std::mt19937 Gen{seed};
       std::shuffle(std::next(BlockOrder.begin()), BlockOrder.end(),Gen);
     } else {
       std::reverse(std::next(BlockOrder.begin()), BlockOrder.end());
